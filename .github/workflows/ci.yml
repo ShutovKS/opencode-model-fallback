@@ -13,5 +13,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
+      - name: Install opencode for e2e tests
+        run: bun install -g opencode-ai
       - run: bun test
       - run: bun run build

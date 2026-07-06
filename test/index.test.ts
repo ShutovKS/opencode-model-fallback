@@ -66,6 +66,19 @@ async function emitRateLimit(plugin: ReturnType<typeof createModelFallbackPlugin
   })
 }
 
+async function emitSessionError(
+  plugin: ReturnType<typeof createModelFallbackPlugin>,
+  model: { providerID: string; modelID: string },
+  status = 429,
+) {
+  await plugin.event({
+    event: {
+      type: "session.error",
+      properties: { sessionID: "ses_1", model, error: { status } },
+    },
+  })
+}
+
 describe("model fallback plugin", () => {
   test("#given a retryable session error #when fallback is enabled #then it retries with the next model", async () => {
     // given
@@ -223,6 +236,32 @@ describe("model fallback plugin", () => {
     expect(output.message).toEqual({ model: { providerID: "openai", modelID: "gpt-5.1-codex" } })
   })
 
+  test("#given session state was created before model is known #when unavailable chat model arrives #then it skips to fallback", async () => {
+    const { runtime } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      unavailable_models: ["anthropic/claude-opus"],
+      fallback_models: ["openai/gpt-5.1-codex"],
+    })
+    const output = {
+      message: {},
+      parts: [],
+    }
+
+    await plugin.event({
+      event: {
+        type: "session.created",
+        properties: { sessionID: "ses_1", info: { agent: "build" } },
+      },
+    })
+    await plugin["chat.message"]({
+      sessionID: "ses_1",
+      agent: "build",
+      model: { providerID: "anthropic", modelID: "claude-opus" },
+    }, output)
+
+    expect(output.message).toEqual({ model: { providerID: "openai", modelID: "gpt-5.1-codex" } })
+  })
+
   test("#given a configured unavailable default model #when config hook runs #then it rewrites before provider use", async () => {
     // given
     const { runtime } = createRuntime()
@@ -249,6 +288,107 @@ describe("model fallback plugin", () => {
         plan: { model: "openai/gpt-5.1-codex" },
       },
     })
+  })
+
+  test("#given config is disabled #when config hook runs #then models are left unchanged", async () => {
+    const { runtime } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      enabled: false,
+      unavailable_models: ["anthropic/claude-opus"],
+      fallback_models: ["openai/gpt-5.1-codex"],
+    })
+    const config = {
+      model: "anthropic/claude-opus",
+      agent: { build: { model: "anthropic/claude-opus" } },
+    }
+
+    await plugin.config(config)
+
+    expect(config).toEqual({
+      model: "anthropic/claude-opus",
+      agent: { build: { model: "anthropic/claude-opus" } },
+    })
+  })
+
+  test("#given no fallback models configured #when retryable error fires #then it does nothing", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {})
+    await emitSessionCreated(plugin)
+    await emitRateLimit(plugin)
+    expect(prompts).toHaveLength(0)
+  })
+
+  test("#given a session.error without sessionID #when it fires #then it does nothing", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+    })
+    await plugin.event({
+      event: {
+        type: "session.error",
+        properties: { error: { status: 429 } },
+      },
+    })
+    expect(prompts).toHaveLength(0)
+  })
+
+  test("#given fallback is disabled at session level #when chat.message runs #then it does not override", async () => {
+    const { runtime } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+    })
+    await emitSessionCreated(plugin)
+    await plugin.tool.model_fallback_control.execute({ action: "disable" }, {
+      sessionID: "ses_1", messageID: "msg_tool", agent: "build",
+      directory: "/repo", worktree: "/repo",
+      abort: new AbortController().signal,
+      metadata: () => undefined, ask: async () => undefined,
+    })
+    const output = { message: {}, parts: [] }
+    await plugin["chat.message"]({ sessionID: "ses_1" }, output)
+    expect(output.message).toEqual({})
+  })
+
+  test("#given current model equals original #when chat.message runs #then it does not override", async () => {
+    const { runtime } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+    })
+    await emitSessionCreated(plugin)
+    const output = { message: {}, parts: [] }
+    await plugin["chat.message"]({
+      sessionID: "ses_1",
+      model: { providerID: "anthropic", modelID: "claude-opus" },
+    }, output)
+    expect(output.message).toEqual({})
+  })
+
+  test("#given model_fallback_control #when status is requested #then it returns current state", async () => {
+    const { runtime } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+    })
+    await emitSessionCreated(plugin)
+    const result = await plugin.tool.model_fallback_control.execute({ action: "status" }, {
+      sessionID: "ses_1", messageID: "msg_tool", agent: "build",
+      directory: "/repo", worktree: "/repo",
+      abort: new AbortController().signal,
+      metadata: () => undefined, ask: async () => undefined,
+    })
+    const parsed = JSON.parse(String(result))
+    expect(parsed).toMatchObject({ enabled: true, attempts: 0 })
+  })
+
+  test("#given model_fallback_control #when unknown action is used #then it returns an error message", async () => {
+    const { runtime } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {})
+    const result = await plugin.tool.model_fallback_control.execute({ action: "unknown" }, {
+      sessionID: "ses_1", messageID: "msg_tool", agent: "build",
+      directory: "/repo", worktree: "/repo",
+      abort: new AbortController().signal,
+      metadata: () => undefined, ask: async () => undefined,
+    })
+    expect(String(result)).toContain("Unknown action")
   })
 
   test("#given a session override #when reset runs #then config default is restored", async () => {
@@ -285,12 +425,181 @@ describe("model fallback plugin", () => {
     // then
     expect(JSON.parse(String(result))).toMatchObject({ enabled: true, override: null, attempts: 0 })
   })
+
+  test("#given several fallback models #when errors keep firing #then it cycles then stops on cooldown", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex", "anthropic/claude-sonnet"],
+      max_attempts: 5,
+    })
+    await emitSessionCreated(plugin)
+
+    await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-opus" })
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.body.model).toEqual({ providerID: "openai", modelID: "gpt-5.1-codex" })
+
+    await emitSessionError(plugin, { providerID: "openai", modelID: "gpt-5.1-codex" })
+    expect(prompts).toHaveLength(2)
+    expect(prompts[1]?.body.model).toEqual({ providerID: "anthropic", modelID: "claude-sonnet" })
+
+    // both fallbacks now cooling; no further model available
+    await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-sonnet" })
+    expect(prompts).toHaveLength(2)
+  })
+
+  test("#given max_attempts reached #when another error fires #then it stops retrying", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex", "anthropic/claude-sonnet"],
+      max_attempts: 2,
+    })
+    await emitSessionCreated(plugin)
+
+    await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-opus" })
+    await emitSessionError(plugin, { providerID: "openai", modelID: "gpt-5.1-codex" })
+    expect(prompts).toHaveLength(2)
+
+    // attempts now 2 == max, cap kicks in before nextModel
+    await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-sonnet" })
+    expect(prompts).toHaveLength(2)
+  })
+
+  test("#given a retry already in flight #when a second error fires #then it is ignored", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+    })
+    await emitSessionCreated(plugin)
+
+    const error = {
+      event: {
+        type: "session.error",
+        properties: {
+          sessionID: "ses_1",
+          model: { providerID: "anthropic", modelID: "claude-opus" },
+          error: { status: 429, message: "rate limit" },
+        },
+      },
+    }
+    await Promise.all([plugin.event(error), plugin.event(error)])
+    expect(prompts).toHaveLength(1)
+  })
+
+  test("#given a retried session #when it is deleted then errors again #then state is rebuilt from scratch", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      max_attempts: 1,
+    })
+    await emitSessionCreated(plugin)
+
+    await emitRateLimit(plugin)
+    expect(prompts).toHaveLength(1)
+
+    // max_attempts reached; without cleanup a second error would be ignored
+    await plugin.event({ event: { type: "session.deleted", properties: { sessionID: "ses_1" } } })
+    await emitRateLimit(plugin)
+    expect(prompts).toHaveLength(2)
+  })
+
+  test("#given a fallback was selected #when a stale error from the prior model arrives #then it is ignored", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+    })
+    await emitSessionCreated(plugin)
+    await emitRateLimit(plugin)
+    expect(prompts).toHaveLength(1)
+
+    // stale error reporting the old model, not the one we just switched to
+    await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-opus" })
+    expect(prompts).toHaveLength(1)
+  })
+
+  test("#given the user switches models mid-session #when the next error fires #then attempts are reset", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      max_attempts: 1,
+    })
+    await emitSessionCreated(plugin)
+
+    await emitRateLimit(plugin)
+    // cap reached for claude-opus; a follow-up error on the fallback is also capped
+    await emitSessionError(plugin, { providerID: "openai", modelID: "gpt-5.1-codex" })
+    expect(prompts).toHaveLength(1)
+
+    // user manually switches to a new model via chat.message
+    await plugin["chat.message"](
+      { sessionID: "ses_1", model: { providerID: "anthropic", modelID: "claude-sonnet" } },
+      { message: {}, parts: [] },
+    )
+
+    // error on the new model should retry from scratch
+    await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-sonnet" })
+    expect(prompts).toHaveLength(2)
+  })
+
+  test("#given notify is disabled #when a retry fires #then no toast is shown", async () => {
+    const { runtime, prompts, toasts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      notify: false,
+    })
+    await emitSessionCreated(plugin)
+    await emitRateLimit(plugin)
+    expect(prompts).toHaveLength(1)
+    expect(toasts).toHaveLength(0)
+  })
+
+  test("#given real OpenCode APIError shape #when retryable status fires #then it retries", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+    })
+
+    await plugin.event({
+      event: {
+        type: "session.created",
+        properties: {
+          sessionID: "ses_1",
+          info: {
+            id: "ses_1",
+            agent: "build",
+            model: { providerID: "anthropic", id: "claude-opus" },
+          },
+        },
+      },
+    })
+    await plugin.event({
+      event: {
+        type: "session.error",
+        properties: {
+          sessionID: "ses_1",
+          error: {
+            name: "APIError",
+            data: { statusCode: 429, isRetryable: true, message: "too busy" },
+          },
+        },
+      },
+    })
+
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.body.model).toEqual({ providerID: "openai", modelID: "gpt-5.1-codex" })
+  })
 })
 
 describe("helpers", () => {
   test("#given model strings #when parsed #then provider and model are split once", () => {
     expect(parseModel("openai/gpt-5.1-codex")).toEqual({ providerID: "openai", modelID: "gpt-5.1-codex" })
     expect(parseModel("badmodel")).toBeUndefined()
+  })
+
+  test("#given a model id with slashes #when parsed #then only the first slash splits provider", () => {
+    expect(parseModel("openai/gpt-5.1-codex/mini")).toEqual({
+      providerID: "openai",
+      modelID: "gpt-5.1-codex/mini",
+    })
   })
 
   test("#given options #when normalized #then invalid models are dropped", () => {
@@ -301,6 +610,14 @@ describe("helpers", () => {
     expect(isRetryableError({ status: 503 }, [503])).toBe(true)
     expect(isRetryableError("model is temporarily unavailable", [])).toBe(true)
     expect(isRetryableError({ status: 401 }, [503])).toBe(false)
+  })
+
+  test("#given an error with nested response status #when classified #then it is retryable", () => {
+    expect(isRetryableError({ response: { status: 503 } }, [503])).toBe(true)
+  })
+
+  test("#given an OpenCode APIError #when classified #then data.statusCode is retryable", () => {
+    expect(isRetryableError({ name: "APIError", data: { statusCode: 429, message: "busy" } }, [429])).toBe(true)
   })
 
   test("#given messages response #when extracting payload #then last user message wins", () => {

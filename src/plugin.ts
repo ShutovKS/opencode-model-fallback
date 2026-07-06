@@ -189,6 +189,11 @@ function statusCode(error: unknown): number | undefined {
   if (typeof direct === "number") return direct
   if (typeof direct === "string" && /^\d+$/.test(direct)) return Number(direct)
 
+  const data = isRecord(error.data) ? error.data : undefined
+  const dataStatus = data?.statusCode ?? data?.status ?? data?.code
+  if (typeof dataStatus === "number") return dataStatus
+  if (typeof dataStatus === "string" && /^\d+$/.test(dataStatus)) return Number(dataStatus)
+
   const response = isRecord(error.response) ? error.response : undefined
   const responseStatus = response?.status
   return typeof responseStatus === "number" ? responseStatus : undefined
@@ -461,7 +466,7 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
       const state = states.get(chatInput.sessionID) ?? (requestedModel
         ? getState(states, chatInput.sessionID, requestedModel, chatInput.agent)
         : undefined)
-      if (!state || !isEnabled(config, state) || !state.currentModel) return
+      if (!state || !isEnabled(config, state)) return
 
       if (requestedModel === state.pendingModel) {
         state.pendingModel = undefined
@@ -479,6 +484,8 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
         output.message.model = parsed
         return
       }
+
+      if (!state.currentModel) return
 
       if (requestedModel && requestedModel !== state.currentModel) {
         state.originalModel = requestedModel
@@ -500,4 +507,5 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
 
 const plugin = (async (input, options) => createModelFallbackPlugin(input, options as Options)) satisfies Plugin
 
+export const ModelFallbackPlugin = plugin
 export default plugin

@@ -1,1 +1,1 @@
-export { default } from "./plugin"
+export { ModelFallbackPlugin, default } from "./plugin"

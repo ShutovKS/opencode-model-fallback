@@ -236,6 +236,26 @@ describe("model fallback plugin", () => {
     expect(output.message).toEqual({ model: { providerID: "openai", modelID: "gpt-5.1-codex" } })
   })
 
+  test("#given first fallback is also unavailable #when first chat message runs #then it skips to the next fallback", async () => {
+    const { runtime } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      unavailable_models: ["anthropic/claude-opus", "openai/gpt-5.1-codex"],
+      fallback_models: ["openai/gpt-5.1-codex", "google/gemini-2.5-pro"],
+    })
+    const output = {
+      message: {},
+      parts: [],
+    }
+
+    await plugin["chat.message"]({
+      sessionID: "ses_1",
+      agent: "build",
+      model: { providerID: "anthropic", modelID: "claude-opus" },
+    }, output)
+
+    expect(output.message).toEqual({ model: { providerID: "google", modelID: "gemini-2.5-pro" } })
+  })
+
   test("#given session state was created before model is known #when unavailable chat model arrives #then it skips to fallback", async () => {
     const { runtime } = createRuntime()
     const plugin = createModelFallbackPlugin(runtime, {
@@ -286,6 +306,31 @@ describe("model fallback plugin", () => {
       agent: {
         build: { model: "openai/gpt-5.1-codex" },
         plan: { model: "openai/gpt-5.1-codex" },
+      },
+    })
+  })
+
+  test("#given first fallback is also unavailable #when config hook runs #then it skips to the next fallback", async () => {
+    const { runtime } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      unavailable_models: ["anthropic/claude-opus", "openai/gpt-5.1-codex"],
+      fallback_models: ["openai/gpt-5.1-codex", "google/gemini-2.5-pro"],
+    })
+    const config = {
+      model: "anthropic/claude-opus",
+      agent: {
+        build: { model: "anthropic/claude-opus" },
+        plan: { model: "openai/gpt-5.1-codex" },
+      },
+    }
+
+    await plugin.config(config)
+
+    expect(config).toEqual({
+      model: "google/gemini-2.5-pro",
+      agent: {
+        build: { model: "google/gemini-2.5-pro" },
+        plan: { model: "google/gemini-2.5-pro" },
       },
     })
   })
@@ -445,6 +490,20 @@ describe("model fallback plugin", () => {
     // both fallbacks now cooling; no further model available
     await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-sonnet" })
     expect(prompts).toHaveLength(2)
+  })
+
+  test("#given first fallback is also unavailable #when retrying a failed model #then it skips to the next fallback", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      unavailable_models: ["openai/gpt-5.1-codex"],
+      fallback_models: ["openai/gpt-5.1-codex", "google/gemini-2.5-pro"],
+    })
+    await emitSessionCreated(plugin)
+
+    await emitRateLimit(plugin)
+
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.body.model).toEqual({ providerID: "google", modelID: "gemini-2.5-pro" })
   })
 
   test("#given max_attempts reached #when another error fires #then it stops retrying", async () => {

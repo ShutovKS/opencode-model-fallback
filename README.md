@@ -1,4 +1,4 @@
-# opencode-model-fallback
+# @shutovks/opencode-model-fallback
 
 OpenCode plugin that keeps a session alive when the current model fails with rate limits, quota exhaustion, overloads, or temporary provider errors.
 
@@ -7,7 +7,7 @@ It retries the last user message in the same session with the next configured fa
 ## Install
 
 ```bash
-bun add -g opencode-model-fallback
+bun add -g @shutovks/opencode-model-fallback
 ```
 
 Or use any package manager OpenCode can resolve from your `plugin` config.
@@ -21,7 +21,7 @@ Add the plugin to `opencode.json` or `.opencode/opencode.json`:
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
     [
-      "opencode-model-fallback",
+      "@shutovks/opencode-model-fallback",
       {
         "enabled": true,
         "fallback_models": [

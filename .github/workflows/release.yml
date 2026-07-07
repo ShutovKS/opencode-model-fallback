@@ -24,6 +24,8 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun run build
+      - name: Install opencode for e2e tests
+        run: bun install -g opencode-ai
       - run: bun test
       - name: Publish to npm (skip if this version is already published)
         run: |

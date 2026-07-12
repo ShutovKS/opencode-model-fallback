@@ -280,12 +280,16 @@ function nextModel(config: Config, state: SessionState): string | undefined {
   const now = Date.now()
   return config.fallbackModels.find((model) => {
     if (model === state.currentModel) return false
+    if (config.unavailableModels.includes(model)) return false
     return (state.failedUntil.get(model) ?? 0) <= now
   })
 }
 
 function firstFallbackFor(config: Config, model: string): string | undefined {
-  return config.fallbackModels.find((fallbackModel) => fallbackModel !== model)
+  return config.fallbackModels.find((fallbackModel) => {
+    if (fallbackModel === model) return false
+    return !config.unavailableModels.includes(fallbackModel)
+  })
 }
 
 function fallbackForUnavailable(config: Config, model: string | undefined): string | undefined {

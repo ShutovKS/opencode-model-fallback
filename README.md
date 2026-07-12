@@ -105,3 +105,7 @@ bun run build
 ## License
 
 MIT
+
+---
+
+> This project is independent and is not built by, endorsed by, or affiliated with the [OpenCode](https://opencode.ai) team.

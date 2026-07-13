@@ -549,6 +549,47 @@ describe("model fallback plugin", () => {
     expect(prompts).toHaveLength(2)
   })
 
+  test("#given max_attempts reached within the window #when the window elapses #then fallback is allowed again", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex", "anthropic/claude-sonnet"],
+      max_attempts: 1,
+      attempts_window_ms: 2,
+    })
+    await emitSessionCreated(plugin)
+
+    // opus fails -> switch to codex (1 attempt in window)
+    await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-opus" })
+    expect(prompts).toHaveLength(1)
+
+    // codex fails within the window -> cap reached, blocked
+    await emitSessionError(plugin, { providerID: "openai", modelID: "gpt-5.1-codex" })
+    expect(prompts).toHaveLength(1)
+
+    // window elapses; the earlier attempt no longer counts
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    await emitSessionError(plugin, { providerID: "openai", modelID: "gpt-5.1-codex" })
+    expect(prompts).toHaveLength(2)
+    expect(prompts[1]?.body.model).toEqual({ providerID: "anthropic", modelID: "claude-sonnet" })
+  })
+
+  test("#given attempts_window_ms is 0 #when the cap is reached #then it stays an absolute lifetime limit", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex", "anthropic/claude-sonnet"],
+      max_attempts: 1,
+      attempts_window_ms: 0,
+    })
+    await emitSessionCreated(plugin)
+
+    await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-opus" })
+    expect(prompts).toHaveLength(1)
+
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    await emitSessionError(plugin, { providerID: "openai", modelID: "gpt-5.1-codex" })
+    expect(prompts).toHaveLength(1)
+  })
+
   test("#given a retry already in flight #when a second error fires #then it is ignored", async () => {
     const { runtime, prompts } = createRuntime()
     const plugin = createModelFallbackPlugin(runtime, {

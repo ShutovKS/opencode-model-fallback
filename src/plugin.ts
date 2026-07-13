@@ -8,6 +8,7 @@ export type Options = {
   retry_on_errors?: number[]
   retry_on_patterns?: string[]
   max_attempts?: number
+  attempts_window_ms?: number
   cooldown_ms?: number
   recover_original_model?: boolean
   notify?: boolean
@@ -20,6 +21,7 @@ type Config = {
   retryOnErrors: number[]
   retryPatterns: RegExp[]
   maxAttempts: number
+  attemptsWindowMs: number
   cooldownMs: number
   recoverOriginal: boolean
   notify: boolean
@@ -41,6 +43,7 @@ type SessionState = {
   currentModel?: string
   agent?: string
   attempts: number
+  attemptTimes: number[]
   failedUntil: Map<string, number>
   enabledOverride?: boolean
   pendingModel?: string
@@ -125,6 +128,7 @@ const DEFAULT_CONFIG: Config = {
   retryOnErrors: [429, 500, 502, 503, 504],
   retryPatterns: RETRYABLE_PATTERNS,
   maxAttempts: 3,
+  attemptsWindowMs: 600_000,
   cooldownMs: 60_000,
   recoverOriginal: true,
   notify: true,
@@ -163,6 +167,7 @@ export function normalizeOptions(options: Options = {}): Config {
     retryOnErrors: options.retry_on_errors ?? DEFAULT_CONFIG.retryOnErrors,
     retryPatterns: [...RETRYABLE_PATTERNS, ...compileRetryPatterns(options.retry_on_patterns)],
     maxAttempts: options.max_attempts ?? DEFAULT_CONFIG.maxAttempts,
+    attemptsWindowMs: options.attempts_window_ms ?? DEFAULT_CONFIG.attemptsWindowMs,
     cooldownMs: options.cooldown_ms ?? DEFAULT_CONFIG.cooldownMs,
     recoverOriginal: options.recover_original_model ?? DEFAULT_CONFIG.recoverOriginal,
     notify: options.notify ?? DEFAULT_CONFIG.notify,
@@ -304,6 +309,7 @@ function getState(states: Map<string, SessionState>, sessionID: string, model?: 
       currentModel: model,
       agent,
       attempts: 0,
+      attemptTimes: [],
       failedUntil: new Map(),
     }
     states.set(sessionID, state)
@@ -324,6 +330,21 @@ function pruneExpiredCooldowns(state: SessionState, now: number): void {
   for (const [model, until] of state.failedUntil) {
     if (until <= now) state.failedUntil.delete(model)
   }
+}
+
+// Count fallback attempts inside the sliding window, pruning older ones.
+// A window of 0 (or less) disables the window and counts for the whole session.
+function windowedAttemptCount(config: Config, state: SessionState, now: number): number {
+  if (config.attemptsWindowMs > 0) {
+    const cutoff = now - config.attemptsWindowMs
+    state.attemptTimes = state.attemptTimes.filter((time) => time > cutoff)
+  }
+  return state.attemptTimes.length
+}
+
+function clearAttempts(state: SessionState): void {
+  state.attempts = 0
+  state.attemptTimes = []
 }
 
 function nextModel(config: Config, state: SessionState): string | undefined {
@@ -349,7 +370,7 @@ function fallbackForUnavailable(config: Config, model: string | undefined): stri
 
 function resetState(state: SessionState): void {
   state.currentModel = state.originalModel
-  state.attempts = 0
+  clearAttempts(state)
   state.failedUntil.clear()
   state.enabledOverride = undefined
   state.pendingModel = undefined
@@ -358,6 +379,12 @@ function resetState(state: SessionState): void {
 
 function statusText(config: Config, state: SessionState | undefined): string {
   const enabled = isEnabled(config, state)
+  const now = Date.now()
+  const windowAttempts = !state
+    ? 0
+    : config.attemptsWindowMs > 0
+      ? state.attemptTimes.filter((time) => time > now - config.attemptsWindowMs).length
+      : state.attemptTimes.length
   return JSON.stringify({
     enabled,
     defaultEnabled: config.enabled,
@@ -365,6 +392,8 @@ function statusText(config: Config, state: SessionState | undefined): string {
     currentModel: state?.currentModel ?? null,
     originalModel: state?.originalModel ?? null,
     attempts: state?.attempts ?? 0,
+    windowAttempts,
+    attemptsWindowMs: config.attemptsWindowMs,
     maxAttempts: config.maxAttempts,
     fallbackModels: config.fallbackModels,
     unavailableModels: config.unavailableModels,
@@ -485,13 +514,14 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
       if (!isEnabled(config, state)) return
       if (config.fallbackModels.length === 0) return
       if (!isRetryableError(props.error, config.retryOnErrors, config.retryPatterns)) return
-      if (state.attempts >= config.maxAttempts) return
+
+      const now = Date.now()
+      if (windowedAttemptCount(config, state, now) >= config.maxAttempts) return
 
       const eventModel = resolveEventModel(props)
       if (state.awaitingModel && eventModel && eventModel !== state.awaitingModel) return
       state.awaitingModel = undefined
 
-      const now = Date.now()
       pruneExpiredCooldowns(state, now)
 
       const failedModel = eventModel ?? state.currentModel
@@ -509,6 +539,7 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
         if (!accepted) return
 
         state.attempts += 1
+        state.attemptTimes.push(now)
         state.currentModel = model
         state.pendingModel = model
         state.awaitingModel = model
@@ -547,7 +578,7 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
       if (requestedModel && requestedModel !== state.currentModel) {
         state.originalModel = requestedModel
         state.currentModel = requestedModel
-        state.attempts = 0
+        clearAttempts(state)
         state.failedUntil.clear()
         state.pendingModel = undefined
         state.awaitingModel = undefined
@@ -567,7 +598,7 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
           const parsed = parseModel(restored)
           if (parsed) {
             state.currentModel = restored
-            state.attempts = 0
+            clearAttempts(state)
             state.pendingModel = undefined
             state.awaitingModel = undefined
             output.message.model = parsed

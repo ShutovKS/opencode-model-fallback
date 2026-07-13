@@ -9,6 +9,7 @@ export type Options = {
   retry_on_patterns?: string[]
   max_attempts?: number
   cooldown_ms?: number
+  recover_original_model?: boolean
   notify?: boolean
 }
 
@@ -20,6 +21,7 @@ type Config = {
   retryPatterns: RegExp[]
   maxAttempts: number
   cooldownMs: number
+  recoverOriginal: boolean
   notify: boolean
 }
 
@@ -124,6 +126,7 @@ const DEFAULT_CONFIG: Config = {
   retryPatterns: RETRYABLE_PATTERNS,
   maxAttempts: 3,
   cooldownMs: 60_000,
+  recoverOriginal: true,
   notify: true,
 }
 
@@ -161,6 +164,7 @@ export function normalizeOptions(options: Options = {}): Config {
     retryPatterns: [...RETRYABLE_PATTERNS, ...compileRetryPatterns(options.retry_on_patterns)],
     maxAttempts: options.max_attempts ?? DEFAULT_CONFIG.maxAttempts,
     cooldownMs: options.cooldown_ms ?? DEFAULT_CONFIG.cooldownMs,
+    recoverOriginal: options.recover_original_model ?? DEFAULT_CONFIG.recoverOriginal,
     notify: options.notify ?? DEFAULT_CONFIG.notify,
   }
 }
@@ -551,6 +555,27 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
       }
 
       if (state.currentModel === state.originalModel) return
+
+      // Recovery: once the original model's cooldown has expired, return to it
+      // instead of staying on the fallback for the rest of the session.
+      if (config.recoverOriginal && state.originalModel && !config.unavailableModels.includes(state.originalModel)) {
+        const now = Date.now()
+        pruneExpiredCooldowns(state, now)
+        const originalUntil = state.failedUntil.get(state.originalModel) ?? 0
+        if (originalUntil <= now) {
+          const restored = state.originalModel
+          const parsed = parseModel(restored)
+          if (parsed) {
+            state.currentModel = restored
+            state.attempts = 0
+            state.pendingModel = undefined
+            state.awaitingModel = undefined
+            output.message.model = parsed
+            await showToast(`Recovered to ${restored}`)
+            return
+          }
+        }
+      }
 
       const parsed = parseModel(state.currentModel)
       if (parsed) output.message.model = parsed

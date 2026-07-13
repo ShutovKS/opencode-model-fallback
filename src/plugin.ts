@@ -182,26 +182,47 @@ export function resolveEventModel(properties: unknown): string | undefined {
     ?? (providerID && modelID ? `${providerID}/${modelID}` : undefined)
 }
 
-function statusCode(error: unknown): number | undefined {
-  if (!isRecord(error)) return undefined
+const MAX_CAUSE_DEPTH = 5
 
-  const direct = error.statusCode ?? error.status ?? error.code
-  if (typeof direct === "number") return direct
-  if (typeof direct === "string" && /^\d+$/.test(direct)) return Number(direct)
-
-  const data = isRecord(error.data) ? error.data : undefined
-  const dataStatus = data?.statusCode ?? data?.status ?? data?.code
-  if (typeof dataStatus === "number") return dataStatus
-  if (typeof dataStatus === "string" && /^\d+$/.test(dataStatus)) return Number(dataStatus)
-
-  const response = isRecord(error.response) ? error.response : undefined
-  const responseStatus = response?.status
-  return typeof responseStatus === "number" ? responseStatus : undefined
+function numericField(value: unknown): number | undefined {
+  if (typeof value === "number") return value
+  if (typeof value === "string" && /^\d+$/.test(value)) return Number(value)
+  return undefined
 }
 
-function errorText(error: unknown): string {
+function ownStatusCode(error: Record<string, unknown>): number | undefined {
+  const direct = numericField(error.statusCode ?? error.status ?? error.code)
+  if (direct !== undefined) return direct
+
+  const data = isRecord(error.data) ? error.data : undefined
+  const dataStatus = numericField(data?.statusCode ?? data?.status ?? data?.code)
+  if (dataStatus !== undefined) return dataStatus
+
+  const response = isRecord(error.response) ? error.response : undefined
+  return numericField(response?.status)
+}
+
+function statusCode(error: unknown, depth = 0): number | undefined {
+  if (!isRecord(error)) return undefined
+
+  const own = ownStatusCode(error)
+  if (own !== undefined) return own
+
+  if (depth >= MAX_CAUSE_DEPTH) return undefined
+  return statusCode(error.cause, depth + 1)
+}
+
+function errorText(error: unknown, depth = 0): string {
   if (typeof error === "string") return error
-  if (error instanceof Error) return `${error.name} ${error.message}`
+
+  if (error instanceof Error) {
+    let text = `${error.name} ${error.message}`
+    if (depth < MAX_CAUSE_DEPTH && error.cause !== undefined) {
+      const causeText = errorText(error.cause, depth + 1)
+      if (causeText) text = `${text} ${causeText}`
+    }
+    return text
+  }
 
   try {
     return JSON.stringify(error)

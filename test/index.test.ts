@@ -625,6 +625,29 @@ describe("model fallback plugin", () => {
     expect(prompts).toHaveLength(2)
   })
 
+  test("#given a custom retry pattern #when a matching provider error fires #then it retries", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      retry_on_patterns: ["capacity constraints"],
+    })
+    await emitSessionCreated(plugin)
+
+    await plugin.event({
+      event: {
+        type: "session.error",
+        properties: {
+          sessionID: "ses_1",
+          model: { providerID: "anthropic", modelID: "claude-opus" },
+          error: { message: "hit capacity constraints, retry" },
+        },
+      },
+    })
+
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.body.model).toEqual({ providerID: "openai", modelID: "gpt-5.1-codex" })
+  })
+
   test("#given notify is disabled #when a retry fires #then no toast is shown", async () => {
     const { runtime, prompts, toasts } = createRuntime()
     const plugin = createModelFallbackPlugin(runtime, {
@@ -722,6 +745,25 @@ describe("helpers", () => {
     const err: Record<string, unknown> = { message: "boom" }
     err.cause = err
     expect(isRetryableError(err, [429])).toBe(false)
+  })
+
+  test("#given a bare 'try again' message #when classified #then it is not retryable", () => {
+    expect(isRetryableError("please try again with a different prompt", [])).toBe(false)
+  })
+
+  test("#given a transient 'try again later' message #when classified #then it is retryable", () => {
+    expect(isRetryableError("rate exceeded, please try again later", [])).toBe(true)
+    expect(isRetryableError("try again in 20 seconds", [])).toBe(true)
+  })
+
+  test("#given custom retry_on_patterns #when normalized #then they extend the defaults", () => {
+    const config = normalizeOptions({ retry_on_patterns: ["capacity constraints", "(invalid"] })
+    // default pattern still works
+    expect(isRetryableError("overloaded", [], config.retryPatterns)).toBe(true)
+    // custom pattern matches
+    expect(isRetryableError("hit capacity constraints", [], config.retryPatterns)).toBe(true)
+    // invalid regex source was skipped, not crashed on
+    expect(isRetryableError("something else", [], config.retryPatterns)).toBe(false)
   })
 
   test("#given messages response #when extracting payload #then last user message wins", () => {

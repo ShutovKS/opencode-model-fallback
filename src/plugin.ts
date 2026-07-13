@@ -276,6 +276,12 @@ function isEnabled(config: Config, state: SessionState | undefined): boolean {
   return state?.enabledOverride ?? config.enabled
 }
 
+function pruneExpiredCooldowns(state: SessionState, now: number): void {
+  for (const [model, until] of state.failedUntil) {
+    if (until <= now) state.failedUntil.delete(model)
+  }
+}
+
 function nextModel(config: Config, state: SessionState): string | undefined {
   const now = Date.now()
   return config.fallbackModels.find((model) => {
@@ -441,10 +447,13 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
       if (state.awaitingModel && eventModel && eventModel !== state.awaitingModel) return
       state.awaitingModel = undefined
 
+      const now = Date.now()
+      pruneExpiredCooldowns(state, now)
+
       const failedModel = eventModel ?? state.currentModel
       if (failedModel) {
         state.currentModel = failedModel
-        state.failedUntil.set(failedModel, Date.now() + config.cooldownMs)
+        state.failedUntil.set(failedModel, now + config.cooldownMs)
       }
 
       const model = nextModel(config, state)

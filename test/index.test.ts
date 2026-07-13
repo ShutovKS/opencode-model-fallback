@@ -492,6 +492,32 @@ describe("model fallback plugin", () => {
     expect(prompts).toHaveLength(2)
   })
 
+  test("#given a model cooldown has expired #when a later error fires #then the model is reusable and stale cooldowns are pruned", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex", "anthropic/claude-sonnet"],
+      max_attempts: 10,
+      cooldown_ms: 1,
+    })
+    await emitSessionCreated(plugin)
+
+    // opus fails -> switch to codex
+    await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-opus" })
+    expect(prompts[0]?.body.model).toEqual({ providerID: "openai", modelID: "gpt-5.1-codex" })
+
+    // codex fails -> switch to sonnet
+    await emitSessionError(plugin, { providerID: "openai", modelID: "gpt-5.1-codex" })
+    expect(prompts[1]?.body.model).toEqual({ providerID: "anthropic", modelID: "claude-sonnet" })
+
+    // wait for the 1ms cooldowns to expire so codex is selectable again
+    await new Promise((resolve) => setTimeout(resolve, 5))
+
+    // sonnet fails -> codex cooldown expired, so it is reused
+    await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-sonnet" })
+    expect(prompts).toHaveLength(3)
+    expect(prompts[2]?.body.model).toEqual({ providerID: "openai", modelID: "gpt-5.1-codex" })
+  })
+
   test("#given first fallback is also unavailable #when retrying a failed model #then it skips to the next fallback", async () => {
     const { runtime, prompts } = createRuntime()
     const plugin = createModelFallbackPlugin(runtime, {

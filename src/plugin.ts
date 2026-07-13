@@ -6,6 +6,7 @@ export type Options = {
   fallback_models?: string[]
   unavailable_models?: string[]
   retry_on_errors?: number[]
+  retry_on_patterns?: string[]
   max_attempts?: number
   cooldown_ms?: number
   notify?: boolean
@@ -16,6 +17,7 @@ type Config = {
   fallbackModels: string[]
   unavailableModels: string[]
   retryOnErrors: number[]
+  retryPatterns: RegExp[]
   maxAttempts: number
   cooldownMs: number
   notify: boolean
@@ -93,16 +95,6 @@ type RuntimeInput = {
   }
 }
 
-const DEFAULT_CONFIG: Config = {
-  enabled: true,
-  fallbackModels: [],
-  unavailableModels: [],
-  retryOnErrors: [429, 500, 502, 503, 504],
-  maxAttempts: 3,
-  cooldownMs: 60_000,
-  notify: true,
-}
-
 const RETRYABLE_PATTERNS = [
   /rate.?limit/i,
   /too.?many.?requests/i,
@@ -116,11 +108,37 @@ const RETRYABLE_PATTERNS = [
   /service.?unavailable/i,
   /overloaded/i,
   /temporarily.?unavailable/i,
-  /try.?again/i,
+  // Narrowed: only match the transient "try again later/soon/in Ns" phrasing,
+  // not a bare "try again" which appears in non-retryable messages too.
+  /try.?again\b[\s,]*(?:later|soon|shortly|moment|in\b)/i,
   /(?:^|\s)429(?:\s|$)/,
   /(?:^|\s)503(?:\s|$)/,
   /(?:^|\s)529(?:\s|$)/,
 ]
+
+const DEFAULT_CONFIG: Config = {
+  enabled: true,
+  fallbackModels: [],
+  unavailableModels: [],
+  retryOnErrors: [429, 500, 502, 503, 504],
+  retryPatterns: RETRYABLE_PATTERNS,
+  maxAttempts: 3,
+  cooldownMs: 60_000,
+  notify: true,
+}
+
+function compileRetryPatterns(sources: unknown): RegExp[] {
+  if (!Array.isArray(sources)) return []
+  return sources.reduce<RegExp[]>((acc, source) => {
+    if (typeof source !== "string" || source.length === 0) return acc
+    try {
+      acc.push(new RegExp(source, "i"))
+    } catch {
+      // Ignore invalid regex sources instead of crashing plugin init.
+    }
+    return acc
+  }, [])
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -140,6 +158,7 @@ export function normalizeOptions(options: Options = {}): Config {
     fallbackModels: fallbackModels.filter((model): model is string => typeof model === "string" && parseModel(model) !== undefined),
     unavailableModels: unavailableModels.filter((model): model is string => typeof model === "string" && parseModel(model) !== undefined),
     retryOnErrors: options.retry_on_errors ?? DEFAULT_CONFIG.retryOnErrors,
+    retryPatterns: [...RETRYABLE_PATTERNS, ...compileRetryPatterns(options.retry_on_patterns)],
     maxAttempts: options.max_attempts ?? DEFAULT_CONFIG.maxAttempts,
     cooldownMs: options.cooldown_ms ?? DEFAULT_CONFIG.cooldownMs,
     notify: options.notify ?? DEFAULT_CONFIG.notify,
@@ -231,12 +250,12 @@ function errorText(error: unknown, depth = 0): string {
   }
 }
 
-export function isRetryableError(error: unknown, retryOnErrors: number[]): boolean {
+export function isRetryableError(error: unknown, retryOnErrors: number[], patterns: RegExp[] = RETRYABLE_PATTERNS): boolean {
   const status = statusCode(error)
   if (status !== undefined && retryOnErrors.includes(status)) return true
 
   const text = errorText(error)
-  return RETRYABLE_PATTERNS.some((pattern) => pattern.test(text))
+  return patterns.some((pattern) => pattern.test(text))
 }
 
 function extractMessages(response: unknown): unknown[] {
@@ -461,7 +480,7 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
       const state = getState(states, sessionID, resolveEventModel(props), stringField(props, "agent"))
       if (!isEnabled(config, state)) return
       if (config.fallbackModels.length === 0) return
-      if (!isRetryableError(props.error, config.retryOnErrors)) return
+      if (!isRetryableError(props.error, config.retryOnErrors, config.retryPatterns)) return
       if (state.attempts >= config.maxAttempts) return
 
       const eventModel = resolveEventModel(props)

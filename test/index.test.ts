@@ -705,6 +705,25 @@ describe("helpers", () => {
     expect(isRetryableError({ name: "APIError", data: { statusCode: 429, message: "busy" } }, [429])).toBe(true)
   })
 
+  test("#given a wrapped fetch error #when the status is on error.cause #then it is retryable", () => {
+    expect(isRetryableError({ message: "fetch failed", cause: { statusCode: 503 } }, [503])).toBe(true)
+  })
+
+  test("#given a nested cause chain #when a retryable status is buried deep #then it is found", () => {
+    expect(isRetryableError({ cause: { cause: { status: 429 } } }, [429])).toBe(true)
+  })
+
+  test("#given an Error with a cause carrying retryable text #when classified #then it is retryable", () => {
+    const err = new TypeError("fetch failed", { cause: new Error("service unavailable") })
+    expect(isRetryableError(err, [])).toBe(true)
+  })
+
+  test("#given a circular cause chain #when classified #then it terminates without matching", () => {
+    const err: Record<string, unknown> = { message: "boom" }
+    err.cause = err
+    expect(isRetryableError(err, [429])).toBe(false)
+  })
+
   test("#given messages response #when extracting payload #then last user message wins", () => {
     expect(getLastUserPayload({
       data: [

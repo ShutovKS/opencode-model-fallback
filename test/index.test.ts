@@ -648,6 +648,69 @@ describe("model fallback plugin", () => {
     expect(prompts[0]?.body.model).toEqual({ providerID: "openai", modelID: "gpt-5.1-codex" })
   })
 
+  test("#given a fallback is active and original still cooling #when chat.message runs #then it stays on the fallback", async () => {
+    const { runtime } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      cooldown_ms: 60_000,
+    })
+    await emitSessionCreated(plugin)
+    await emitRateLimit(plugin)
+
+    const output = { message: {}, parts: [] }
+    await plugin["chat.message"]({ sessionID: "ses_1" }, output)
+
+    expect(output.message).toEqual({ model: { providerID: "openai", modelID: "gpt-5.1-codex" } })
+  })
+
+  test("#given a fallback is active and original cooldown expired #when chat.message runs #then it recovers to the original model", async () => {
+    const { runtime, toasts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      cooldown_ms: 1,
+    })
+    await emitSessionCreated(plugin)
+    await emitRateLimit(plugin)
+
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    const output = { message: {}, parts: [] }
+    await plugin["chat.message"]({ sessionID: "ses_1" }, output)
+
+    expect(output.message).toEqual({ model: { providerID: "anthropic", modelID: "claude-opus" } })
+    // switch toast + recovery toast
+    expect(toasts).toHaveLength(2)
+
+    // status should reflect we are back on the original with attempts reset
+    const status = await plugin.tool.model_fallback_control.execute({ action: "status" }, {
+      sessionID: "ses_1", messageID: "msg_tool", agent: "build",
+      directory: "/repo", worktree: "/repo",
+      abort: new AbortController().signal,
+      metadata: () => undefined, ask: async () => undefined,
+    })
+    expect(JSON.parse(String(status))).toMatchObject({
+      currentModel: "anthropic/claude-opus",
+      originalModel: "anthropic/claude-opus",
+      attempts: 0,
+    })
+  })
+
+  test("#given recover_original_model is disabled #when original cooldown expires #then it stays on the fallback", async () => {
+    const { runtime } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      cooldown_ms: 1,
+      recover_original_model: false,
+    })
+    await emitSessionCreated(plugin)
+    await emitRateLimit(plugin)
+
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    const output = { message: {}, parts: [] }
+    await plugin["chat.message"]({ sessionID: "ses_1" }, output)
+
+    expect(output.message).toEqual({ model: { providerID: "openai", modelID: "gpt-5.1-codex" } })
+  })
+
   test("#given notify is disabled #when a retry fires #then no toast is shown", async () => {
     const { runtime, prompts, toasts } = createRuntime()
     const plugin = createModelFallbackPlugin(runtime, {

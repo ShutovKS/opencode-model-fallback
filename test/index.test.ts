@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { createModelFallbackPlugin, getLastUserPayload, isRetryableError, normalizeOptions, parseModel } from "../src/plugin"
+import { computeBackoff, createModelFallbackPlugin, getLastUserPayload, isRetryableError, normalizeOptions, parseModel } from "../src/plugin"
 
 type PromptInput = {
   path: { id: string }
@@ -492,6 +492,42 @@ describe("model fallback plugin", () => {
     expect(prompts).toHaveLength(2)
   })
 
+  test("#given a model cooldown has expired #when a later error fires #then the model is reusable and stale cooldowns are pruned", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex", "anthropic/claude-sonnet"],
+      max_attempts: 10,
+      cooldown_ms: 1,
+    })
+    await emitSessionCreated(plugin)
+
+    // opus fails -> switch to codex
+    await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-opus" })
+    expect(prompts[0]?.body.model).toEqual({ providerID: "openai", modelID: "gpt-5.1-codex" })
+
+    // codex fails -> switch to sonnet
+    await emitSessionError(plugin, { providerID: "openai", modelID: "gpt-5.1-codex" })
+    expect(prompts[1]?.body.model).toEqual({ providerID: "anthropic", modelID: "claude-sonnet" })
+
+    // wait for the 1ms cooldowns to expire so codex is selectable again
+    await new Promise((resolve) => setTimeout(resolve, 5))
+
+    // sonnet fails -> codex cooldown expired, so it is reused
+    await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-sonnet" })
+    expect(prompts).toHaveLength(3)
+    expect(prompts[2]?.body.model).toEqual({ providerID: "openai", modelID: "gpt-5.1-codex" })
+
+    // pruning is observable through status: the expired opus/codex cooldowns
+    // were removed, only the fresh sonnet cooldown remains
+    const status = await plugin.tool.model_fallback_control.execute({ action: "status" }, {
+      sessionID: "ses_1", messageID: "msg_tool", agent: "build",
+      directory: "/repo", worktree: "/repo",
+      abort: new AbortController().signal,
+      metadata: () => undefined, ask: async () => undefined,
+    })
+    expect(Object.keys(JSON.parse(String(status)).cooling)).toEqual(["anthropic/claude-sonnet"])
+  })
+
   test("#given first fallback is also unavailable #when retrying a failed model #then it skips to the next fallback", async () => {
     const { runtime, prompts } = createRuntime()
     const plugin = createModelFallbackPlugin(runtime, {
@@ -521,6 +557,100 @@ describe("model fallback plugin", () => {
     // attempts now 2 == max, cap kicks in before nextModel
     await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-sonnet" })
     expect(prompts).toHaveLength(2)
+  })
+
+  test("#given max_attempts reached within the window #when the window elapses #then fallback is allowed again", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex", "anthropic/claude-sonnet"],
+      max_attempts: 1,
+      attempts_window_ms: 2,
+    })
+    await emitSessionCreated(plugin)
+
+    // opus fails -> switch to codex (1 attempt in window)
+    await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-opus" })
+    expect(prompts).toHaveLength(1)
+
+    // codex fails within the window -> cap reached, blocked
+    await emitSessionError(plugin, { providerID: "openai", modelID: "gpt-5.1-codex" })
+    expect(prompts).toHaveLength(1)
+
+    // window elapses; the earlier attempt no longer counts
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    await emitSessionError(plugin, { providerID: "openai", modelID: "gpt-5.1-codex" })
+    expect(prompts).toHaveLength(2)
+    expect(prompts[1]?.body.model).toEqual({ providerID: "anthropic", modelID: "claude-sonnet" })
+  })
+
+  test("#given attempts_window_ms is 0 #when the cap is reached #then it stays an absolute lifetime limit", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex", "anthropic/claude-sonnet"],
+      max_attempts: 1,
+      attempts_window_ms: 0,
+    })
+    await emitSessionCreated(plugin)
+
+    await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-opus" })
+    expect(prompts).toHaveLength(1)
+
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    await emitSessionError(plugin, { providerID: "openai", modelID: "gpt-5.1-codex" })
+    expect(prompts).toHaveLength(1)
+  })
+
+  test("#given fallbacks and a failure #when status is requested #then it reports failure counts and switch history", async () => {
+    const { runtime } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex", "anthropic/claude-sonnet"],
+      max_attempts: 5,
+    })
+    await emitSessionCreated(plugin)
+
+    await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-opus" })
+    await emitSessionError(plugin, { providerID: "openai", modelID: "gpt-5.1-codex" })
+
+    const status = await plugin.tool.model_fallback_control.execute({ action: "status" }, {
+      sessionID: "ses_1", messageID: "msg_tool", agent: "build",
+      directory: "/repo", worktree: "/repo",
+      abort: new AbortController().signal,
+      metadata: () => undefined, ask: async () => undefined,
+    })
+    const parsed = JSON.parse(String(status))
+    expect(parsed.failureCounts).toEqual({
+      "anthropic/claude-opus": 1,
+      "openai/gpt-5.1-codex": 1,
+    })
+    expect(parsed.switches).toEqual([
+      expect.objectContaining({ from: "anthropic/claude-opus", to: "openai/gpt-5.1-codex", reason: "fallback" }),
+      expect.objectContaining({ from: "openai/gpt-5.1-codex", to: "anthropic/claude-sonnet", reason: "fallback" }),
+    ])
+  })
+
+  test("#given a reset #when status is requested #then metrics and history are cleared", async () => {
+    const { runtime } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+    })
+    await emitSessionCreated(plugin)
+    await emitRateLimit(plugin)
+
+    await plugin.tool.model_fallback_control.execute({ action: "reset" }, {
+      sessionID: "ses_1", messageID: "msg_tool", agent: "build",
+      directory: "/repo", worktree: "/repo",
+      abort: new AbortController().signal,
+      metadata: () => undefined, ask: async () => undefined,
+    })
+    const status = await plugin.tool.model_fallback_control.execute({ action: "status" }, {
+      sessionID: "ses_1", messageID: "msg_tool", agent: "build",
+      directory: "/repo", worktree: "/repo",
+      abort: new AbortController().signal,
+      metadata: () => undefined, ask: async () => undefined,
+    })
+    const parsed = JSON.parse(String(status))
+    expect(parsed.failureCounts).toEqual({})
+    expect(parsed.switches).toEqual([])
   })
 
   test("#given a retry already in flight #when a second error fires #then it is ignored", async () => {
@@ -597,6 +727,222 @@ describe("model fallback plugin", () => {
     // error on the new model should retry from scratch
     await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-sonnet" })
     expect(prompts).toHaveLength(2)
+  })
+
+  test("#given a custom retry pattern #when a matching provider error fires #then it retries", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      retry_on_patterns: ["capacity constraints"],
+    })
+    await emitSessionCreated(plugin)
+
+    await plugin.event({
+      event: {
+        type: "session.error",
+        properties: {
+          sessionID: "ses_1",
+          model: { providerID: "anthropic", modelID: "claude-opus" },
+          error: { message: "hit capacity constraints, retry" },
+        },
+      },
+    })
+
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.body.model).toEqual({ providerID: "openai", modelID: "gpt-5.1-codex" })
+  })
+
+  test("#given a fallback is active and original still cooling #when chat.message runs #then it stays on the fallback", async () => {
+    const { runtime } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      cooldown_ms: 60_000,
+    })
+    await emitSessionCreated(plugin)
+    await emitRateLimit(plugin)
+
+    const output = { message: {}, parts: [] }
+    await plugin["chat.message"]({ sessionID: "ses_1" }, output)
+
+    expect(output.message).toEqual({ model: { providerID: "openai", modelID: "gpt-5.1-codex" } })
+  })
+
+  test("#given a fallback is active and original cooldown expired #when chat.message runs #then it recovers to the original model", async () => {
+    const { runtime, toasts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      cooldown_ms: 1,
+    })
+    await emitSessionCreated(plugin)
+    await emitRateLimit(plugin)
+
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    const output = { message: {}, parts: [] }
+    await plugin["chat.message"]({ sessionID: "ses_1" }, output)
+
+    expect(output.message).toEqual({ model: { providerID: "anthropic", modelID: "claude-opus" } })
+    // switch toast + recovery toast
+    expect(toasts).toHaveLength(2)
+
+    // status should reflect we are back on the original with attempts reset
+    const status = await plugin.tool.model_fallback_control.execute({ action: "status" }, {
+      sessionID: "ses_1", messageID: "msg_tool", agent: "build",
+      directory: "/repo", worktree: "/repo",
+      abort: new AbortController().signal,
+      metadata: () => undefined, ask: async () => undefined,
+    })
+    expect(JSON.parse(String(status))).toMatchObject({
+      currentModel: "anthropic/claude-opus",
+      originalModel: "anthropic/claude-opus",
+      attempts: 0,
+    })
+    // the switch and the recovery are both recorded in history
+    expect(JSON.parse(String(status)).switches).toEqual([
+      expect.objectContaining({ from: "anthropic/claude-opus", to: "openai/gpt-5.1-codex", reason: "fallback" }),
+      expect.objectContaining({ from: "openai/gpt-5.1-codex", to: "anthropic/claude-opus", reason: "recovery" }),
+    ])
+  })
+
+  test("#given recover_original_model is disabled #when original cooldown expires #then it stays on the fallback", async () => {
+    const { runtime } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      cooldown_ms: 1,
+      recover_original_model: false,
+    })
+    await emitSessionCreated(plugin)
+    await emitRateLimit(plugin)
+
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    const output = { message: {}, parts: [] }
+    await plugin["chat.message"]({ sessionID: "ses_1" }, output)
+
+    expect(output.message).toEqual({ model: { providerID: "openai", modelID: "gpt-5.1-codex" } })
+  })
+
+  test("#given the runtime echoes prompts back through chat.message #when the plugin retries #then its own retry prompt is not mistaken for a manual switch and recovery still works", async () => {
+    // In the live runtime session.promptAsync triggers the chat.message hook
+    // for the plugin's own retry prompt. If pendingModel is set only after
+    // promptAsync resolves, that echoed hook call looks like a manual model
+    // switch: originalModel gets overwritten with the fallback and recovery
+    // never fires (regression caught by the in-process e2e).
+    const { runtime, toasts } = createRuntime()
+    let plugin!: ReturnType<typeof createModelFallbackPlugin>
+    const basePrompt = runtime.client.session.promptAsync
+    runtime.client.session.promptAsync = async (input: PromptInput) => {
+      await basePrompt(input)
+      // echo the prompt back through the hook, like the real server does
+      await plugin["chat.message"](
+        { sessionID: input.path.id, model: input.body.model },
+        { message: {}, parts: [] },
+      )
+    }
+    plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      cooldown_ms: 1,
+    })
+    await emitSessionCreated(plugin)
+    await emitRateLimit(plugin)
+
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    // follow-up user prompt on the fallback model -> recovery branch
+    const output = { message: {}, parts: [] }
+    await plugin["chat.message"](
+      { sessionID: "ses_1", model: { providerID: "openai", modelID: "gpt-5.1-codex" } },
+      output,
+    )
+
+    expect(output.message).toEqual({ model: { providerID: "anthropic", modelID: "claude-opus" } })
+    // switch toast + recovery toast
+    expect(toasts).toHaveLength(2)
+  })
+
+  test("#given a backoff is configured #when a retry fires #then it delays before re-prompting but still retries", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      backoff_ms: 12,
+    })
+    await emitSessionCreated(plugin)
+
+    const start = Date.now()
+    await emitRateLimit(plugin)
+    const elapsed = Date.now() - start
+
+    expect(prompts).toHaveLength(1)
+    // equal jitter -> at least half of backoff_ms elapsed before the prompt
+    expect(elapsed).toBeGreaterThanOrEqual(5)
+  })
+
+  test("#given debug is disabled #when a retry fires #then nothing is written to stderr", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      debug: false,
+    })
+    const writes: string[] = []
+    const original = process.stderr.write.bind(process.stderr)
+    process.stderr.write = ((chunk: unknown) => { writes.push(String(chunk)); return true }) as typeof process.stderr.write
+    try {
+      await emitSessionCreated(plugin)
+      await emitRateLimit(plugin)
+    } finally {
+      process.stderr.write = original
+    }
+
+    expect(prompts).toHaveLength(1)
+    expect(writes.join("")).toBe("")
+  })
+
+  test("#given debug is enabled #when a retry fires #then the decision is logged to stderr", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      debug: true,
+    })
+    const writes: string[] = []
+    const original = process.stderr.write.bind(process.stderr)
+    process.stderr.write = ((chunk: unknown) => { writes.push(String(chunk)); return true }) as typeof process.stderr.write
+    try {
+      await emitSessionCreated(plugin)
+      await emitRateLimit(plugin)
+    } finally {
+      process.stderr.write = original
+    }
+
+    const log = writes.join("")
+    expect(prompts).toHaveLength(1)
+    expect(log).toContain("[model-fallback]")
+    expect(log).toContain("switched to openai/gpt-5.1-codex")
+  })
+
+  test("#given debug is enabled and error is not retryable #when it fires #then it logs the skip reason", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      debug: true,
+    })
+    const writes: string[] = []
+    const original = process.stderr.write.bind(process.stderr)
+    process.stderr.write = ((chunk: unknown) => { writes.push(String(chunk)); return true }) as typeof process.stderr.write
+    try {
+      await emitSessionCreated(plugin)
+      await plugin.event({
+        event: {
+          type: "session.error",
+          properties: {
+            sessionID: "ses_1",
+            model: { providerID: "anthropic", modelID: "claude-opus" },
+            error: { status: 401, message: "bad key" },
+          },
+        },
+      })
+    } finally {
+      process.stderr.write = original
+    }
+
+    expect(prompts).toHaveLength(0)
+    expect(writes.join("")).toContain("not retryable")
   })
 
   test("#given notify is disabled #when a retry fires #then no toast is shown", async () => {
@@ -677,6 +1023,76 @@ describe("helpers", () => {
 
   test("#given an OpenCode APIError #when classified #then data.statusCode is retryable", () => {
     expect(isRetryableError({ name: "APIError", data: { statusCode: 429, message: "busy" } }, [429])).toBe(true)
+  })
+
+  test("#given a wrapped fetch error #when the status is on error.cause #then it is retryable", () => {
+    expect(isRetryableError({ message: "fetch failed", cause: { statusCode: 503 } }, [503])).toBe(true)
+  })
+
+  test("#given a nested cause chain #when a retryable status is buried deep #then it is found", () => {
+    expect(isRetryableError({ cause: { cause: { status: 429 } } }, [429])).toBe(true)
+  })
+
+  test("#given an Error with a cause carrying retryable text #when classified #then it is retryable", () => {
+    const err = new TypeError("fetch failed", { cause: new Error("service unavailable") })
+    expect(isRetryableError(err, [])).toBe(true)
+  })
+
+  test("#given a plain object whose cause is an Error with retryable text #when classified #then it is retryable", () => {
+    // JSON.stringify(new Error(...)) yields "{}", so the text would be lost
+    // without explicit cause traversal for non-Error wrappers
+    expect(isRetryableError({ message: "request failed", cause: new Error("model is overloaded") }, [])).toBe(true)
+  })
+
+  test("#given a circular plain-object cause chain #when classified by text #then it terminates without matching", () => {
+    const err: Record<string, unknown> = { message: "boom" }
+    err.cause = { cause: err }
+    expect(isRetryableError(err, [])).toBe(false)
+  })
+
+  test("#given a circular cause chain #when classified #then it terminates without matching", () => {
+    const err: Record<string, unknown> = { message: "boom" }
+    err.cause = err
+    expect(isRetryableError(err, [429])).toBe(false)
+  })
+
+  test("#given a bare 'try again' message #when classified #then it is not retryable", () => {
+    expect(isRetryableError("please try again with a different prompt", [])).toBe(false)
+  })
+
+  test("#given a transient 'try again later' message #when classified #then it is retryable", () => {
+    expect(isRetryableError("rate exceeded, please try again later", [])).toBe(true)
+    expect(isRetryableError("try again in 20 seconds", [])).toBe(true)
+  })
+
+  test("#given custom retry_on_patterns #when normalized #then they extend the defaults", () => {
+    const config = normalizeOptions({ retry_on_patterns: ["capacity constraints", "(invalid"] })
+    // default pattern still works
+    expect(isRetryableError("overloaded", [], config.retryPatterns)).toBe(true)
+    // custom pattern matches
+    expect(isRetryableError("hit capacity constraints", [], config.retryPatterns)).toBe(true)
+    // invalid regex source was skipped, not crashed on
+    expect(isRetryableError("something else", [], config.retryPatterns)).toBe(false)
+  })
+
+  test("#given backoff disabled #when computed #then it returns 0", () => {
+    const config = normalizeOptions({ backoff_ms: 0 })
+    expect(computeBackoff(config, 0, () => 0.5)).toBe(0)
+  })
+
+  test("#given backoff enabled #when computed #then it grows exponentially within the equal-jitter band", () => {
+    const config = normalizeOptions({ backoff_ms: 100, backoff_max_ms: 10_000 })
+    // equal jitter: result in [base/2, base]; random=0 -> lower bound, random=1 -> upper bound
+    expect(computeBackoff(config, 0, () => 0)).toBe(50)
+    expect(computeBackoff(config, 0, () => 1)).toBe(100)
+    expect(computeBackoff(config, 1, () => 0)).toBe(100) // base 200 -> half 100
+    expect(computeBackoff(config, 2, () => 1)).toBe(400) // base 400 -> up to 400
+  })
+
+  test("#given backoff would exceed the cap #when computed #then it is clamped to backoff_max_ms", () => {
+    const config = normalizeOptions({ backoff_ms: 1000, backoff_max_ms: 2000 })
+    // base capped at 2000 regardless of attempt index; upper bound is 2000
+    expect(computeBackoff(config, 10, () => 1)).toBe(2000)
   })
 
   test("#given messages response #when extracting payload #then last user message wins", () => {

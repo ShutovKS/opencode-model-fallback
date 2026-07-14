@@ -590,6 +590,59 @@ describe("model fallback plugin", () => {
     expect(prompts).toHaveLength(1)
   })
 
+  test("#given fallbacks and a failure #when status is requested #then it reports failure counts and switch history", async () => {
+    const { runtime } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex", "anthropic/claude-sonnet"],
+      max_attempts: 5,
+    })
+    await emitSessionCreated(plugin)
+
+    await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-opus" })
+    await emitSessionError(plugin, { providerID: "openai", modelID: "gpt-5.1-codex" })
+
+    const status = await plugin.tool.model_fallback_control.execute({ action: "status" }, {
+      sessionID: "ses_1", messageID: "msg_tool", agent: "build",
+      directory: "/repo", worktree: "/repo",
+      abort: new AbortController().signal,
+      metadata: () => undefined, ask: async () => undefined,
+    })
+    const parsed = JSON.parse(String(status))
+    expect(parsed.failureCounts).toEqual({
+      "anthropic/claude-opus": 1,
+      "openai/gpt-5.1-codex": 1,
+    })
+    expect(parsed.switches).toEqual([
+      expect.objectContaining({ from: "anthropic/claude-opus", to: "openai/gpt-5.1-codex", reason: "fallback" }),
+      expect.objectContaining({ from: "openai/gpt-5.1-codex", to: "anthropic/claude-sonnet", reason: "fallback" }),
+    ])
+  })
+
+  test("#given a reset #when status is requested #then metrics and history are cleared", async () => {
+    const { runtime } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+    })
+    await emitSessionCreated(plugin)
+    await emitRateLimit(plugin)
+
+    await plugin.tool.model_fallback_control.execute({ action: "reset" }, {
+      sessionID: "ses_1", messageID: "msg_tool", agent: "build",
+      directory: "/repo", worktree: "/repo",
+      abort: new AbortController().signal,
+      metadata: () => undefined, ask: async () => undefined,
+    })
+    const status = await plugin.tool.model_fallback_control.execute({ action: "status" }, {
+      sessionID: "ses_1", messageID: "msg_tool", agent: "build",
+      directory: "/repo", worktree: "/repo",
+      abort: new AbortController().signal,
+      metadata: () => undefined, ask: async () => undefined,
+    })
+    const parsed = JSON.parse(String(status))
+    expect(parsed.failureCounts).toEqual({})
+    expect(parsed.switches).toEqual([])
+  })
+
   test("#given a retry already in flight #when a second error fires #then it is ignored", async () => {
     const { runtime, prompts } = createRuntime()
     const plugin = createModelFallbackPlugin(runtime, {
@@ -733,6 +786,11 @@ describe("model fallback plugin", () => {
       originalModel: "anthropic/claude-opus",
       attempts: 0,
     })
+    // the switch and the recovery are both recorded in history
+    expect(JSON.parse(String(status)).switches).toEqual([
+      expect.objectContaining({ from: "anthropic/claude-opus", to: "openai/gpt-5.1-codex", reason: "fallback" }),
+      expect.objectContaining({ from: "openai/gpt-5.1-codex", to: "anthropic/claude-opus", reason: "recovery" }),
+    ])
   })
 
   test("#given recover_original_model is disabled #when original cooldown expires #then it stays on the fallback", async () => {

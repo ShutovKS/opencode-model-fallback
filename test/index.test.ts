@@ -810,6 +810,43 @@ describe("model fallback plugin", () => {
     expect(output.message).toEqual({ model: { providerID: "openai", modelID: "gpt-5.1-codex" } })
   })
 
+  test("#given the runtime echoes prompts back through chat.message #when the plugin retries #then its own retry prompt is not mistaken for a manual switch and recovery still works", async () => {
+    // In the live runtime session.promptAsync triggers the chat.message hook
+    // for the plugin's own retry prompt. If pendingModel is set only after
+    // promptAsync resolves, that echoed hook call looks like a manual model
+    // switch: originalModel gets overwritten with the fallback and recovery
+    // never fires (regression caught by the in-process e2e).
+    const { runtime, toasts } = createRuntime()
+    let plugin!: ReturnType<typeof createModelFallbackPlugin>
+    const basePrompt = runtime.client.session.promptAsync
+    runtime.client.session.promptAsync = async (input: PromptInput) => {
+      await basePrompt(input)
+      // echo the prompt back through the hook, like the real server does
+      await plugin["chat.message"](
+        { sessionID: input.path.id, model: input.body.model },
+        { message: {}, parts: [] },
+      )
+    }
+    plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      cooldown_ms: 1,
+    })
+    await emitSessionCreated(plugin)
+    await emitRateLimit(plugin)
+
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    // follow-up user prompt on the fallback model -> recovery branch
+    const output = { message: {}, parts: [] }
+    await plugin["chat.message"](
+      { sessionID: "ses_1", model: { providerID: "openai", modelID: "gpt-5.1-codex" } },
+      output,
+    )
+
+    expect(output.message).toEqual({ model: { providerID: "anthropic", modelID: "claude-opus" } })
+    // switch toast + recovery toast
+    expect(toasts).toHaveLength(2)
+  })
+
   test("#given a backoff is configured #when a retry fires #then it delays before re-prompting but still retries", async () => {
     const { runtime, prompts } = createRuntime()
     const plugin = createModelFallbackPlugin(runtime, {

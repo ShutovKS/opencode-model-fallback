@@ -610,8 +610,16 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
           await sleep(backoff)
         }
 
+        // Mark the fallback as pending BEFORE prompting: promptAsync triggers
+        // the chat.message hook synchronously for our own retry prompt, and
+        // without pendingModel set that prompt would be mistaken for a manual
+        // model switch (overwriting originalModel and wiping cooldowns).
+        state.pendingModel = model
+        state.awaitingModel = model
         const accepted = await retryWithModel(sessionID, state, model)
         if (!accepted) {
+          state.pendingModel = undefined
+          state.awaitingModel = undefined
           debug(`session ${sessionID}: retry with ${model} not accepted (no last user message)`)
           return
         }
@@ -620,8 +628,6 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
         state.attemptTimes.push(now)
         const previousModel = state.currentModel
         state.currentModel = model
-        state.pendingModel = model
-        state.awaitingModel = model
         recordSwitch(state, previousModel ?? null, model, "fallback", now)
         debug(`session ${sessionID}: switched to ${model} (attempt ${state.attemptTimes.length})`)
         await showToast(`Switched to ${model}`)
@@ -632,9 +638,13 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
 
     "chat.message": async (chatInput: ChatMessageInput, output: ChatMessageOutput) => {
       const requestedModel = normalizeModel(chatInput.model)
-      const state = states.get(chatInput.sessionID) ?? (requestedModel
+      // Always go through getState when a model is present: in the live
+      // runtime session.created carries no model, so the state created by the
+      // event handler has originalModel/currentModel unset and getState
+      // backfills them from the first prompt.
+      const state = requestedModel
         ? getState(states, chatInput.sessionID, requestedModel, chatInput.agent)
-        : undefined)
+        : states.get(chatInput.sessionID)
       if (!state || !isEnabled(config, state)) return
 
       if (requestedModel === state.pendingModel) {

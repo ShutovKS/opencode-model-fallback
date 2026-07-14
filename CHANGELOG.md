@@ -50,8 +50,23 @@ behavior unless noted.
 
 ### Fixed
 
+- **Recovery works in the live runtime.** OpenCode invokes the
+  `chat.message` hook for the plugin's *own* retry prompt. `pendingModel` is
+  now set *before* `session.promptAsync`, so that echoed hook call is no
+  longer mistaken for a manual model switch (which overwrote
+  `originalModel` with the fallback and silently disabled
+  `recover_original_model`). Found by the new in-process e2e suite.
 - **Expired model cooldowns are pruned.** `state.failedUntil` no longer
   accumulates one entry per failed model for the whole session lifetime. (#2)
+
+### Tests
+
+- **In-process e2e suite against a real headless OpenCode server**
+  (`test/e2e-server.test.ts`): boots `opencode serve` via
+  `createOpencodeServer`, drives it through the SDK client, observes plugin
+  decisions through the SSE event stream (`session.error`, `tui.toast.show`,
+  `message.updated`). Covers status-path fallback, `retry_on_patterns`,
+  cascade fallback, and recovery — the paths unit mocks could not validate.
 
 ## [1.0.8] - 2026-07-13
 

@@ -27,6 +27,7 @@ const server = Bun.serve({
           { id: "deny-model", object: "model" },
           { id: "retry-model", object: "model" },
           { id: "unavail-model", object: "model" },
+          { id: "cascade-model", object: "model" },
         ],
       })
     }
@@ -55,6 +56,10 @@ const server = Bun.serve({
       "deny-model": 401,
       "retry-model": 400,
       "unavail-model": 400,
+      // 400 (not auto-retried by OpenCode) so the plugin cascades promptly;
+      // OpenCode self-retries 429/503 with its own backoff before emitting
+      // session.error, which would mask plugin-driven cascade.
+      "cascade-model": 400,
     }
     const status = statusMap[model] ?? 500
     calls.push({ path: url.pathname, model, status })

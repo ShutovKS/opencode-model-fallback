@@ -266,6 +266,15 @@ function errorText(error: unknown, depth = 0): string {
     return text
   }
 
+  // Plain objects: JSON.stringify drops nested Error values (they serialize
+  // to {}), so walk `cause` explicitly with the same depth cap.
+  if (isRecord(error) && depth < MAX_CAUSE_DEPTH && error.cause !== undefined) {
+    const { cause, ...rest } = error
+    const causeText = errorText(cause, depth + 1)
+    const ownText = errorText(rest, MAX_CAUSE_DEPTH)
+    return causeText ? `${ownText} ${causeText}` : ownText
+  }
+
   try {
     return JSON.stringify(error)
   } catch {
@@ -436,6 +445,7 @@ function statusText(config: Config, state: SessionState | undefined): string {
     fallbackModels: config.fallbackModels,
     unavailableModels: config.unavailableModels,
     failureCounts: state ? Object.fromEntries(state.failureCounts) : {},
+    cooling: state ? Object.fromEntries(state.failedUntil) : {},
     switches: state?.switches ?? [],
   })
 }

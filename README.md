@@ -81,7 +81,7 @@ Actions:
 
 - `enable`: enable fallback for the current session.
 - `disable`: disable fallback for the current session.
-- `status`: return effective state, current model, attempts, windowed attempt count, per-model `failureCounts`, recent `switches`, and configured fallbacks.
+- `status`: return effective state, current model, attempts, windowed attempt count, per-model `failureCounts`, active `cooling` cooldowns (model → expiry timestamp), recent `switches`, and configured fallbacks.
 - `reset`: clear session state and return to the config default.
 
 Session overrides are in memory only. They disappear when the session is deleted or OpenCode restarts.

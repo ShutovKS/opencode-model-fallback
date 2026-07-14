@@ -14,6 +14,7 @@ export type Options = {
   backoff_max_ms?: number
   recover_original_model?: boolean
   notify?: boolean
+  debug?: boolean
 }
 
 type Config = {
@@ -29,6 +30,7 @@ type Config = {
   backoffMaxMs: number
   recoverOriginal: boolean
   notify: boolean
+  debug: boolean
 }
 
 type ModelRef = {
@@ -138,6 +140,7 @@ const DEFAULT_CONFIG: Config = {
   backoffMaxMs: 30_000,
   recoverOriginal: true,
   notify: true,
+  debug: false,
 }
 
 function compileRetryPatterns(sources: unknown): RegExp[] {
@@ -179,6 +182,7 @@ export function normalizeOptions(options: Options = {}): Config {
     backoffMaxMs: Math.max(0, options.backoff_max_ms ?? DEFAULT_CONFIG.backoffMaxMs),
     recoverOriginal: options.recover_original_model ?? DEFAULT_CONFIG.recoverOriginal,
     notify: options.notify ?? DEFAULT_CONFIG.notify,
+    debug: options.debug ?? DEFAULT_CONFIG.debug,
   }
 }
 
@@ -428,6 +432,13 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
   const states = new Map<string, SessionState>()
   const inFlight = new Set<string>()
 
+  function debug(message: string): void {
+    if (!config.debug) return
+    // OpenCode surfaces plugin stderr in its log stream. Keep it single-line
+    // and prefixed so users can grep for fallback decisions.
+    process.stderr.write(`[model-fallback] ${message}\n`)
+  }
+
   async function showToast(message: string): Promise<void> {
     if (!config.notify) return
 
@@ -531,18 +542,36 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
       }
 
       if (event.type !== "session.error") return
-      if (inFlight.has(sessionID)) return
+      if (inFlight.has(sessionID)) {
+        debug(`session ${sessionID}: error ignored, retry already in flight`)
+        return
+      }
 
       const state = getState(states, sessionID, resolveEventModel(props), stringField(props, "agent"))
-      if (!isEnabled(config, state)) return
-      if (config.fallbackModels.length === 0) return
-      if (!isRetryableError(props.error, config.retryOnErrors, config.retryPatterns)) return
+      if (!isEnabled(config, state)) {
+        debug(`session ${sessionID}: fallback disabled, skipping error`)
+        return
+      }
+      if (config.fallbackModels.length === 0) {
+        debug(`session ${sessionID}: no fallback_models configured, skipping error`)
+        return
+      }
+      if (!isRetryableError(props.error, config.retryOnErrors, config.retryPatterns)) {
+        debug(`session ${sessionID}: error not retryable, skipping (status/text unmatched)`)
+        return
+      }
 
       const now = Date.now()
-      if (windowedAttemptCount(config, state, now) >= config.maxAttempts) return
+      if (windowedAttemptCount(config, state, now) >= config.maxAttempts) {
+        debug(`session ${sessionID}: max_attempts (${config.maxAttempts}) reached in window, skipping`)
+        return
+      }
 
       const eventModel = resolveEventModel(props)
-      if (state.awaitingModel && eventModel && eventModel !== state.awaitingModel) return
+      if (state.awaitingModel && eventModel && eventModel !== state.awaitingModel) {
+        debug(`session ${sessionID}: stale error for ${eventModel}, awaiting ${state.awaitingModel}, skipping`)
+        return
+      }
       state.awaitingModel = undefined
 
       pruneExpiredCooldowns(state, now)
@@ -554,21 +583,31 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
       }
 
       const model = nextModel(config, state)
-      if (!model) return
+      if (!model) {
+        debug(`session ${sessionID}: no fallback model available (all cooling/unavailable)`)
+        return
+      }
 
       inFlight.add(sessionID)
       try {
         const backoff = computeBackoff(config, state.attemptTimes.length)
-        if (backoff > 0) await sleep(backoff)
+        if (backoff > 0) {
+          debug(`session ${sessionID}: backing off ${backoff}ms before retrying with ${model}`)
+          await sleep(backoff)
+        }
 
         const accepted = await retryWithModel(sessionID, state, model)
-        if (!accepted) return
+        if (!accepted) {
+          debug(`session ${sessionID}: retry with ${model} not accepted (no last user message)`)
+          return
+        }
 
         state.attempts += 1
         state.attemptTimes.push(now)
         state.currentModel = model
         state.pendingModel = model
         state.awaitingModel = model
+        debug(`session ${sessionID}: switched to ${model} (attempt ${state.attemptTimes.length})`)
         await showToast(`Switched to ${model}`)
       } finally {
         inFlight.delete(sessionID)
@@ -628,6 +667,7 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
             state.pendingModel = undefined
             state.awaitingModel = undefined
             output.message.model = parsed
+            debug(`session ${chatInput.sessionID}: recovered to ${restored} (cooldown expired)`)
             await showToast(`Recovered to ${restored}`)
             return
           }

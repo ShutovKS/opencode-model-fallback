@@ -769,6 +769,77 @@ describe("model fallback plugin", () => {
     expect(elapsed).toBeGreaterThanOrEqual(5)
   })
 
+  test("#given debug is disabled #when a retry fires #then nothing is written to stderr", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      debug: false,
+    })
+    const writes: string[] = []
+    const original = process.stderr.write.bind(process.stderr)
+    process.stderr.write = ((chunk: unknown) => { writes.push(String(chunk)); return true }) as typeof process.stderr.write
+    try {
+      await emitSessionCreated(plugin)
+      await emitRateLimit(plugin)
+    } finally {
+      process.stderr.write = original
+    }
+
+    expect(prompts).toHaveLength(1)
+    expect(writes.join("")).toBe("")
+  })
+
+  test("#given debug is enabled #when a retry fires #then the decision is logged to stderr", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      debug: true,
+    })
+    const writes: string[] = []
+    const original = process.stderr.write.bind(process.stderr)
+    process.stderr.write = ((chunk: unknown) => { writes.push(String(chunk)); return true }) as typeof process.stderr.write
+    try {
+      await emitSessionCreated(plugin)
+      await emitRateLimit(plugin)
+    } finally {
+      process.stderr.write = original
+    }
+
+    const log = writes.join("")
+    expect(prompts).toHaveLength(1)
+    expect(log).toContain("[model-fallback]")
+    expect(log).toContain("switched to openai/gpt-5.1-codex")
+  })
+
+  test("#given debug is enabled and error is not retryable #when it fires #then it logs the skip reason", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      debug: true,
+    })
+    const writes: string[] = []
+    const original = process.stderr.write.bind(process.stderr)
+    process.stderr.write = ((chunk: unknown) => { writes.push(String(chunk)); return true }) as typeof process.stderr.write
+    try {
+      await emitSessionCreated(plugin)
+      await plugin.event({
+        event: {
+          type: "session.error",
+          properties: {
+            sessionID: "ses_1",
+            model: { providerID: "anthropic", modelID: "claude-opus" },
+            error: { status: 401, message: "bad key" },
+          },
+        },
+      })
+    } finally {
+      process.stderr.write = original
+    }
+
+    expect(prompts).toHaveLength(0)
+    expect(writes.join("")).toContain("not retryable")
+  })
+
   test("#given notify is disabled #when a retry fires #then no toast is shown", async () => {
     const { runtime, prompts, toasts } = createRuntime()
     const plugin = createModelFallbackPlugin(runtime, {

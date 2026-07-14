@@ -1,8 +1,13 @@
 # @shutovks/opencode-model-fallback
 
-OpenCode plugin that keeps a session alive when the current model fails with rate limits, quota exhaustion, overloads, or temporary provider errors.
+> Keep your OpenCode session alive when the model fails — automatic fallback to the next configured model on rate limits, quota exhaustion, overloads, and transient provider errors.
 
-It retries the last user message in the same session with the next configured fallback model.
+[![CI](https://github.com/ShutovKS/opencode-model-fallback/actions/workflows/ci.yml/badge.svg)](https://github.com/ShutovKS/opencode-model-fallback/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/@shutovks/opencode-model-fallback)](https://www.npmjs.com/package/@shutovks/opencode-model-fallback)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Bun](https://img.shields.io/badge/runtime-bun-fa9b3f)](https://bun.sh)
+
+When the active model errors out with a transient failure, this plugin retries the last user message in the same session using the next model from your fallback list — then recovers back to the original once it's healthy again. No lost context, no manual restart.
 
 ## Install
 
@@ -57,7 +62,7 @@ Restart OpenCode after changing config.
 | `max_attempts` | `3` | Max fallback retries within `attempts_window_ms`. |
 | `attempts_window_ms` | `600000` | Sliding window (ms) for `max_attempts`. Older attempts stop counting once outside it. Set `0` for a lifetime cap. |
 | `cooldown_ms` | `60000` | How long to avoid a failed model. |
-| `backoff_ms` | `0` | Base delay for exponential backoff with equal jitter before a retry. `0` = instant (unchanged behavior). |
+| `backoff_ms` | `0` | Base delay for exponential backoff with equal jitter before a retry. `0` = instant. |
 | `backoff_max_ms` | `30000` | Cap for the computed backoff delay. |
 | `recover_original_model` | `true` | Return to the original model once its cooldown expires instead of staying on the fallback. |
 | `notify` | `true` | Show a toast when switching or recovering models. |
@@ -77,58 +82,73 @@ Use it from inside OpenCode to control fallback for the current session:
 Use model_fallback_control to disable fallback in this session.
 ```
 
-Actions:
+| Action | Effect |
+| --- | --- |
+| `enable` | Enable fallback for the current session. |
+| `disable` | Disable fallback for the current session. |
+| `status` | Return effective state, current model, attempts, windowed attempt count, per-model failure counts, active cooldowns, recent switches, and configured fallbacks. |
+| `reset` | Clear session state and return to the config default. |
 
-- `enable`: enable fallback for the current session.
-- `disable`: disable fallback for the current session.
-- `status`: return effective state, current model, attempts, windowed attempt count, per-model `failureCounts`, active `cooling` cooldowns (model → expiry timestamp), recent `switches`, and configured fallbacks.
-- `reset`: clear session state and return to the config default.
-
-Session overrides are in memory only. They disappear when the session is deleted or OpenCode restarts.
+Session overrides live in memory only — they disappear when the session is deleted or OpenCode restarts.
 
 ### `unavailable_models` vs `fallback_models`
 
-These options look similar but act at different times and for different reasons:
+They look similar but act at different times:
 
 | | `fallback_models` | `unavailable_models` |
 | --- | --- | --- |
-| **Purpose** | Models to retry on **when the current model fails** with a transient error. | Models to **skip up front** because they are known-bad (deprecated, no credentials, etc.). |
-| **When it acts** | After a `session.error` (`event` hook) or on recovery (`chat.message`). | Before any provider call, in the `config` hook and `chat.message`. |
-| **Triggered by** | A retryable error at runtime. | Static configuration, no error needed. |
-| **Typical use** | "If `claude-opus` is rate-limited, try `gpt-5.1-codex`." | "Never select `claude-3-opus`; OpenCode errors before `session.error`." |
+| **Purpose** | Retry on these **when the current model fails** with a transient error. | **Skip these up front** because they are known-bad (deprecated, no credentials, etc.). |
+| **When** | After a `session.error` or on recovery. | Before any provider call. |
+| **Trigger** | A retryable error at runtime. | Static configuration — no error needed. |
+| **Example** | "If `claude-opus` is rate-limited, try `gpt-5.1-codex`." | "Never select `claude-3-opus`; OpenCode errors before `session.error`." |
 
-A model can be in both lists, but that's redundant: anything in `unavailable_models` is already filtered out when the plugin chooses the next fallback, so listing it again as a fallback has no effect.
+A model can be in both lists, but that's redundant — anything in `unavailable_models` is already filtered out when the plugin picks the next fallback.
 
 ## What Counts As Retryable
 
-Fallback runs on configured status codes and common transient error text:
+Fallback triggers on configured status codes and common transient error text:
 
 - rate limit / too many requests
 - quota exceeded
 - all credentials for model exhausted
 - model unsupported
 - service unavailable / overloaded / temporarily unavailable
-- "try again" **with a transient qualifier** (later / soon / shortly / in Ns) — a bare "try again" does not match
+- "try again" **with a transient qualifier** (later / soon / shortly / in Ns) — a bare "try again" does **not** match
 - `429`, `503`, `529` in plain text errors
 
 Status codes and text are also detected through the wrapped `error.cause` chain, so a 429/503 buried in a fetch error still triggers fallback. Add your own phrases with `retry_on_patterns`.
 
 ## Troubleshooting
 
-**Fallback never triggers.**
+<details>
+<summary><b>Fallback never triggers</b></summary>
+
 Turn on `debug: true` and reproduce. The `[model-fallback] …` lines in the OpenCode log explain each skip: disabled, no `fallback_models`, "not retryable" (status/text unmatched), `max_attempts` reached, or no available model.
+</details>
 
-**Fallback triggers too aggressively.**
-A provider's non-transient message may be matching a pattern. Check `debug` output, then either narrow `retry_on_errors` or add `retry_on_patterns` for only the phrases you want. Note the bare "try again" no longer matches by default.
+<details>
+<summary><b>Fallback triggers too aggressively</b></summary>
 
-**Session stuck on a fallback model.**
+A provider's non-transient message may be matching a pattern. Check `debug` output, then either narrow `retry_on_errors` or set `retry_on_patterns` to only the phrases you want. Note that a bare "try again" no longer matches by default.
+</details>
+
+<details>
+<summary><b>Session stuck on a fallback model</b></summary>
+
 Expected only while the original model's cooldown (`cooldown_ms`) is active. Once it expires the next message recovers to the original model — unless `recover_original_model: false` or the original is in `unavailable_models`.
+</details>
 
-**Fallback stops retrying partway through a long session.**
+<details>
+<summary><b>Fallback stops retrying partway through a long session</b></summary>
+
 `max_attempts` counts within `attempts_window_ms` (default 10 min). Raise `max_attempts`, lengthen `attempts_window_ms`, or set `attempts_window_ms: 0` for an absolute lifetime cap.
+</details>
 
-**A known-broken model still gets selected.**
+<details>
+<summary><b>A known-broken model still gets selected</b></summary>
+
 List it in `unavailable_models` so the plugin skips it before any provider call, not only after it fails.
+</details>
 
 ## Limitations
 
@@ -149,7 +169,7 @@ See [CHANGELOG.md](./CHANGELOG.md) for release history.
 
 ## License
 
-MIT
+[MIT](LICENSE)
 
 ---
 

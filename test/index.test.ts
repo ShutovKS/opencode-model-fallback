@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { createModelFallbackPlugin, getLastUserPayload, isRetryableError, normalizeOptions, parseModel } from "../src/plugin"
+import { computeBackoff, createModelFallbackPlugin, getLastUserPayload, isRetryableError, normalizeOptions, parseModel } from "../src/plugin"
 
 type PromptInput = {
   path: { id: string }
@@ -752,6 +752,23 @@ describe("model fallback plugin", () => {
     expect(output.message).toEqual({ model: { providerID: "openai", modelID: "gpt-5.1-codex" } })
   })
 
+  test("#given a backoff is configured #when a retry fires #then it delays before re-prompting but still retries", async () => {
+    const { runtime, prompts } = createRuntime()
+    const plugin = createModelFallbackPlugin(runtime, {
+      fallback_models: ["openai/gpt-5.1-codex"],
+      backoff_ms: 12,
+    })
+    await emitSessionCreated(plugin)
+
+    const start = Date.now()
+    await emitRateLimit(plugin)
+    const elapsed = Date.now() - start
+
+    expect(prompts).toHaveLength(1)
+    // equal jitter -> at least half of backoff_ms elapsed before the prompt
+    expect(elapsed).toBeGreaterThanOrEqual(5)
+  })
+
   test("#given notify is disabled #when a retry fires #then no toast is shown", async () => {
     const { runtime, prompts, toasts } = createRuntime()
     const plugin = createModelFallbackPlugin(runtime, {
@@ -868,6 +885,26 @@ describe("helpers", () => {
     expect(isRetryableError("hit capacity constraints", [], config.retryPatterns)).toBe(true)
     // invalid regex source was skipped, not crashed on
     expect(isRetryableError("something else", [], config.retryPatterns)).toBe(false)
+  })
+
+  test("#given backoff disabled #when computed #then it returns 0", () => {
+    const config = normalizeOptions({ backoff_ms: 0 })
+    expect(computeBackoff(config, 0, () => 0.5)).toBe(0)
+  })
+
+  test("#given backoff enabled #when computed #then it grows exponentially within the equal-jitter band", () => {
+    const config = normalizeOptions({ backoff_ms: 100, backoff_max_ms: 10_000 })
+    // equal jitter: result in [base/2, base]; random=0 -> lower bound, random=1 -> upper bound
+    expect(computeBackoff(config, 0, () => 0)).toBe(50)
+    expect(computeBackoff(config, 0, () => 1)).toBe(100)
+    expect(computeBackoff(config, 1, () => 0)).toBe(100) // base 200 -> half 100
+    expect(computeBackoff(config, 2, () => 1)).toBe(400) // base 400 -> up to 400
+  })
+
+  test("#given backoff would exceed the cap #when computed #then it is clamped to backoff_max_ms", () => {
+    const config = normalizeOptions({ backoff_ms: 1000, backoff_max_ms: 2000 })
+    // base capped at 2000 regardless of attempt index; upper bound is 2000
+    expect(computeBackoff(config, 10, () => 1)).toBe(2000)
   })
 
   test("#given messages response #when extracting payload #then last user message wins", () => {

@@ -10,6 +10,8 @@ export type Options = {
   max_attempts?: number
   attempts_window_ms?: number
   cooldown_ms?: number
+  backoff_ms?: number
+  backoff_max_ms?: number
   recover_original_model?: boolean
   notify?: boolean
 }
@@ -23,6 +25,8 @@ type Config = {
   maxAttempts: number
   attemptsWindowMs: number
   cooldownMs: number
+  backoffMs: number
+  backoffMaxMs: number
   recoverOriginal: boolean
   notify: boolean
 }
@@ -130,6 +134,8 @@ const DEFAULT_CONFIG: Config = {
   maxAttempts: 3,
   attemptsWindowMs: 600_000,
   cooldownMs: 60_000,
+  backoffMs: 0,
+  backoffMaxMs: 30_000,
   recoverOriginal: true,
   notify: true,
 }
@@ -169,6 +175,8 @@ export function normalizeOptions(options: Options = {}): Config {
     maxAttempts: options.max_attempts ?? DEFAULT_CONFIG.maxAttempts,
     attemptsWindowMs: options.attempts_window_ms ?? DEFAULT_CONFIG.attemptsWindowMs,
     cooldownMs: options.cooldown_ms ?? DEFAULT_CONFIG.cooldownMs,
+    backoffMs: Math.max(0, options.backoff_ms ?? DEFAULT_CONFIG.backoffMs),
+    backoffMaxMs: Math.max(0, options.backoff_max_ms ?? DEFAULT_CONFIG.backoffMaxMs),
     recoverOriginal: options.recover_original_model ?? DEFAULT_CONFIG.recoverOriginal,
     notify: options.notify ?? DEFAULT_CONFIG.notify,
   }
@@ -345,6 +353,21 @@ function windowedAttemptCount(config: Config, state: SessionState, now: number):
 function clearAttempts(state: SessionState): void {
   state.attempts = 0
   state.attemptTimes = []
+}
+
+// Exponential backoff with equal jitter. attemptIndex is the number of
+// fallback retries already performed (0 for the first). Returns 0 when
+// backoff is disabled so the retry stays instant.
+export function computeBackoff(config: Config, attemptIndex: number, random: () => number = Math.random): number {
+  if (config.backoffMs <= 0) return 0
+  const exponential = config.backoffMs * 2 ** Math.max(0, attemptIndex)
+  const capped = Math.min(exponential, config.backoffMaxMs || exponential)
+  const half = capped / 2
+  return Math.round(half + random() * half)
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function nextModel(config: Config, state: SessionState): string | undefined {
@@ -535,6 +558,9 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
 
       inFlight.add(sessionID)
       try {
+        const backoff = computeBackoff(config, state.attemptTimes.length)
+        if (backoff > 0) await sleep(backoff)
+
         const accepted = await retryWithModel(sessionID, state, model)
         if (!accepted) return
 

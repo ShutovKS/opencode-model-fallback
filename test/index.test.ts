@@ -516,6 +516,16 @@ describe("model fallback plugin", () => {
     await emitSessionError(plugin, { providerID: "anthropic", modelID: "claude-sonnet" })
     expect(prompts).toHaveLength(3)
     expect(prompts[2]?.body.model).toEqual({ providerID: "openai", modelID: "gpt-5.1-codex" })
+
+    // pruning is observable through status: the expired opus/codex cooldowns
+    // were removed, only the fresh sonnet cooldown remains
+    const status = await plugin.tool.model_fallback_control.execute({ action: "status" }, {
+      sessionID: "ses_1", messageID: "msg_tool", agent: "build",
+      directory: "/repo", worktree: "/repo",
+      abort: new AbortController().signal,
+      metadata: () => undefined, ask: async () => undefined,
+    })
+    expect(Object.keys(JSON.parse(String(status)).cooling)).toEqual(["anthropic/claude-sonnet"])
   })
 
   test("#given first fallback is also unavailable #when retrying a failed model #then it skips to the next fallback", async () => {
@@ -1026,6 +1036,18 @@ describe("helpers", () => {
   test("#given an Error with a cause carrying retryable text #when classified #then it is retryable", () => {
     const err = new TypeError("fetch failed", { cause: new Error("service unavailable") })
     expect(isRetryableError(err, [])).toBe(true)
+  })
+
+  test("#given a plain object whose cause is an Error with retryable text #when classified #then it is retryable", () => {
+    // JSON.stringify(new Error(...)) yields "{}", so the text would be lost
+    // without explicit cause traversal for non-Error wrappers
+    expect(isRetryableError({ message: "request failed", cause: new Error("model is overloaded") }, [])).toBe(true)
+  })
+
+  test("#given a circular plain-object cause chain #when classified by text #then it terminates without matching", () => {
+    const err: Record<string, unknown> = { message: "boom" }
+    err.cause = { cause: err }
+    expect(isRetryableError(err, [])).toBe(false)
   })
 
   test("#given a circular cause chain #when classified #then it terminates without matching", () => {

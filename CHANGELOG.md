@@ -37,6 +37,9 @@ behavior unless noted.
 - **Configurable retry patterns.** New `retry_on_patterns` option appends
   user-supplied case-insensitive regex sources to the built-in patterns.
   Invalid sources are skipped rather than failing plugin init. (#4)
+- **Active cooldowns in `status`.** `model_fallback_control status` now
+  reports `cooling` (model → cooldown-expiry timestamp), making cooldown
+  pruning observable.
 
 ### Changed
 
@@ -46,7 +49,9 @@ behavior unless noted.
 - **Retryable errors are now detected through `error.cause`.** `statusCode`
   and `errorText` walk the cause chain (bounded to depth 5, safe against
   cycles), so a 429/503 buried in a wrapped fetch error triggers fallback.
-  (#3)
+  Plain-object wrappers whose `cause` is an `Error` are also handled —
+  `JSON.stringify` serializes nested `Error`s to `{}`, which previously
+  dropped retryable text. (#3)
 
 ### Fixed
 

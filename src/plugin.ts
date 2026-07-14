@@ -51,6 +51,8 @@ type SessionState = {
   attempts: number
   attemptTimes: number[]
   failedUntil: Map<string, number>
+  failureCounts: Map<string, number>
+  switches: Array<{ from: string | null; to: string; reason: string; at: number }>
   enabledOverride?: boolean
   pendingModel?: string
   awaitingModel?: string
@@ -323,6 +325,8 @@ function getState(states: Map<string, SessionState>, sessionID: string, model?: 
       attempts: 0,
       attemptTimes: [],
       failedUntil: new Map(),
+      failureCounts: new Map(),
+      switches: [],
     }
     states.set(sessionID, state)
     return state
@@ -399,9 +403,16 @@ function resetState(state: SessionState): void {
   state.currentModel = state.originalModel
   clearAttempts(state)
   state.failedUntil.clear()
+  state.failureCounts.clear()
+  state.switches = []
   state.enabledOverride = undefined
   state.pendingModel = undefined
   state.awaitingModel = undefined
+}
+
+function recordSwitch(state: SessionState, from: string | null, to: string, reason: string, at: number): void {
+  state.switches.push({ from, to, reason, at })
+  if (state.switches.length > 20) state.switches.shift()
 }
 
 function statusText(config: Config, state: SessionState | undefined): string {
@@ -424,6 +435,8 @@ function statusText(config: Config, state: SessionState | undefined): string {
     maxAttempts: config.maxAttempts,
     fallbackModels: config.fallbackModels,
     unavailableModels: config.unavailableModels,
+    failureCounts: state ? Object.fromEntries(state.failureCounts) : {},
+    switches: state?.switches ?? [],
   })
 }
 
@@ -580,6 +593,7 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
       if (failedModel) {
         state.currentModel = failedModel
         state.failedUntil.set(failedModel, now + config.cooldownMs)
+        state.failureCounts.set(failedModel, (state.failureCounts.get(failedModel) ?? 0) + 1)
       }
 
       const model = nextModel(config, state)
@@ -604,9 +618,11 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
 
         state.attempts += 1
         state.attemptTimes.push(now)
+        const previousModel = state.currentModel
         state.currentModel = model
         state.pendingModel = model
         state.awaitingModel = model
+        recordSwitch(state, previousModel ?? null, model, "fallback", now)
         debug(`session ${sessionID}: switched to ${model} (attempt ${state.attemptTimes.length})`)
         await showToast(`Switched to ${model}`)
       } finally {
@@ -628,13 +644,16 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
 
       if (requestedModel && config.unavailableModels.includes(requestedModel)) {
         const fallbackModel = firstFallbackFor(config, requestedModel)
-        const parsed = fallbackModel ? parseModel(fallbackModel) : undefined
+        if (!fallbackModel) return
+        const parsed = parseModel(fallbackModel)
         if (!parsed) return
 
+        const from = state.currentModel ?? null
         state.originalModel = requestedModel
         state.currentModel = fallbackModel
         state.pendingModel = fallbackModel
         output.message.model = parsed
+        recordSwitch(state, from, fallbackModel, "unavailable", Date.now())
         return
       }
 
@@ -662,11 +681,13 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
           const restored = state.originalModel
           const parsed = parseModel(restored)
           if (parsed) {
+            const from = state.currentModel ?? null
             state.currentModel = restored
             clearAttempts(state)
             state.pendingModel = undefined
             state.awaitingModel = undefined
             output.message.model = parsed
+            recordSwitch(state, from, restored, "recovery", now)
             debug(`session ${chatInput.sessionID}: recovered to ${restored} (cooldown expired)`)
             await showToast(`Recovered to ${restored}`)
             return

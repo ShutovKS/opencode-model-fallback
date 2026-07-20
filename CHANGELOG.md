@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] - 2026-07-20
+
+### Fixed
+
+- **Show fallback models in the OpenCode UI.** The model used by the plugin's
+  retry prompt is now written to the outgoing message so OpenCode's current
+  model display follows the fallback.
+
 ## [1.1.0] - 2026-07-14
 
 New options are documented in the README; all default to the previous

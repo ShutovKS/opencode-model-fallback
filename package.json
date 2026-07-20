@@ -1,6 +1,6 @@
 {
   "name": "@shutovks/opencode-model-fallback",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "OpenCode plugin that retries failed sessions with fallback models.",
   "homepage": "https://github.com/ShutovKS/opencode-model-fallback#readme",
   "bugs": {

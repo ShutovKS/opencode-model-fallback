@@ -1,5 +1,7 @@
 dist/
 node_modules/
 .codegraph/
+.omo/
+.sisyphus/
 bun.lockb
 *.log

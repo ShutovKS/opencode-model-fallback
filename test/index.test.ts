@@ -191,7 +191,7 @@ describe("model fallback plugin", () => {
     expect(prompts).toHaveLength(0)
   })
 
-  test("#given a fallback model was selected #when next chat message runs #then it applies the model override", async () => {
+  test("#given a fallback retry prompt #when OpenCode prepares its message #then it updates the visible model", async () => {
     // given
     const { runtime } = createRuntime()
     const plugin = createModelFallbackPlugin(runtime, {
@@ -207,6 +207,7 @@ describe("model fallback plugin", () => {
     // when
     await plugin["chat.message"]({
       sessionID: "ses_1",
+      model: { providerID: "openai", modelID: "gpt-5.1-codex" },
     }, output)
 
     // then

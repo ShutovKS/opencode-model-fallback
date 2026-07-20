@@ -657,8 +657,9 @@ export function createModelFallbackPlugin(input: RuntimeInput, options: Options 
         : states.get(chatInput.sessionID)
       if (!state || !isEnabled(config, state)) return
 
-      if (requestedModel === state.pendingModel) {
+      if (chatInput.model && requestedModel === state.pendingModel) {
         state.pendingModel = undefined
+        output.message.model = chatInput.model
         return
       }
 
